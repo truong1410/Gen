@@ -32,7 +32,9 @@ class ConvBlock(nn.Module):
             layers.append(nn.BatchNorm2d(out_ch))
         layers.append(nn.LeakyReLU(0.2, inplace=True))
         self.net = nn.Sequential(*layers)
-    def forward(self, x): return self.net(x)
+
+    def forward(self, x):
+        return self.net(x)
 
 
 # ------------------------
@@ -89,34 +91,37 @@ class VAEpl(pl.LightningModule):
         self.fc_from_z = nn.Linear(emb_channels, flat_dim)
 
         # ---------------- Decoder ----------------
-        # Decoder will map flat back to (C, H, W) and then use ConvBlocks to upsample
-        dec_layers = []
-        # start with a conv that reduce channels from enc_out_ch to hid_chs[-2] maybe
-        dec_in_ch = self._enc_out_shape[0]
-        # We'll use ConvTranspose2d based upsampling to invert the encoder strides
-        # Create a stack of transpose convs that mirror encoder
-        ch_list = list(self._enc_out_shape)
-        # Flattened spatial dims
-        C_enc, H_enc, W_enc = self._enc_out_shape
-        # Initial reshape size for decode
+        # Mirror encoder upsampling so final output matches img_size
         self.flat_dim = flat_dim
-        self.C_enc = C_enc
-        self.H_enc = H_enc
-        self.W_enc = W_enc
+        self.C_enc, self.H_enc, self.W_enc = self._enc_out_shape
 
-        # A small conv stack after reshape
-        dec_conv_layers = []
-        ch = C_enc
-        for i in reversed(range(len(hid_chs))):
-            out_ch = hid_chs[i]
-            # Upsample using ConvTranspose to roughly invert strides
-            dec_conv_layers.append(nn.ConvTranspose2d(ch, out_ch, kernel_size=3, stride=2, padding=1, output_padding=1))
-            dec_conv_layers.append(nn.BatchNorm2d(out_ch))
-            dec_conv_layers.append(nn.LeakyReLU(0.2, inplace=True))
+        dec_layers = []
+        ch = self.C_enc
+
+        # We want to invert the encoder downsample steps.
+        # Encoder strides: [1, 2, 2, 2] (example). Encoder channels: [64,128,256,512]
+        # After encoder, ch=C_enc==hid_chs[-1] (512). We should upsample to 256 -> 128 -> 64 and then final conv -> 3
+        # So choose upsample_channels = reversed(hid_chs[:-1]) -> [256,128,64]
+        upsample_channels = list(reversed(hid_chs[:-1]))
+
+        for out_ch in upsample_channels:
+            dec_layers.append(
+                nn.ConvTranspose2d(
+                    ch,
+                    out_ch,
+                    kernel_size=4,
+                    stride=2,
+                    padding=1
+                )
+            )
+            dec_layers.append(nn.BatchNorm2d(out_ch))
+            dec_layers.append(nn.LeakyReLU(0.2, inplace=True))
             ch = out_ch
-        # final conv to get back to in_channels
-        dec_conv_layers.append(nn.Conv2d(ch, in_channels, kernel_size=3, stride=1, padding=1))
-        self.decoder = nn.Sequential(*dec_conv_layers)
+
+        # final conv (no upsampling)
+        dec_layers.append(nn.Conv2d(ch, in_channels, kernel_size=3, stride=1, padding=1))
+
+        self.decoder = nn.Sequential(*dec_layers)
 
     def encode(self, x):
         e = self.encoder(x)
@@ -138,7 +143,7 @@ class VAEpl(pl.LightningModule):
         x = flat.view(batch, self.C_enc, self.H_enc, self.W_enc)
         x = self.decoder(x)
         # final activation: tanh or sigmoid depending on input normalization
-        # we assume inputs in range [-1, 1] (use Normalize(-1,1) in transforms)
+        # we assume inputs in range [-1, 1] (use Normalize([0.5]*3, [0.5]*3) in transforms)
         x = torch.tanh(x)
         return x
 
@@ -149,6 +154,12 @@ class VAEpl(pl.LightningModule):
         return x_rec, mu, logvar
 
     def loss_function(self, x, x_rec, mu, logvar):
+        # Ensure shapes match (in case user gives wrong img_size)
+        if x_rec.shape != x.shape:
+            # Try to adapt by center-cropping or resizing x_rec to x if only minor mismatch occurs.
+            # But best is to make transforms produce same size as model.img_size.
+            raise RuntimeError(f"Shape mismatch: x_rec {x_rec.shape} vs x {x.shape}. "
+                               "Check img_size and datamodule transforms.")
         if self.recon_loss == "l1":
             recon = F.l1_loss(x_rec, x, reduction="mean")
         else:
@@ -178,6 +189,7 @@ class VAEpl(pl.LightningModule):
         opt = torch.optim.Adam(self.parameters(), lr=self.lr)
         return opt
 
+
 # ------------------------
 # DataModule (ImageFolder)
 # ------------------------
@@ -191,13 +203,13 @@ class EndoDataModule(pl.LightningDataModule):
 
         # transforms: normalize to [-1,1]
         self.train_transform = transforms.Compose([
-            transforms.Resize((img_size, img_size)),
+            transforms.Resize((self.img_size, self.img_size)),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize([0.5]*3, [0.5]*3)   # range [-1,1]
         ])
         self.val_transform = transforms.Compose([
-            transforms.Resize((img_size, img_size)),
+            transforms.Resize((self.img_size, self.img_size)),
             transforms.ToTensor(),
             transforms.Normalize([0.5]*3, [0.5]*3)
         ])
@@ -234,6 +246,7 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=4)
     return p.parse_args()
 
+
 def main():
     args = parse_args()
     current_time = datetime.now().strftime("%Y_%m_%d_%H%M%S")
@@ -267,6 +280,7 @@ def main():
 
     trainer.fit(model, datamodule=dm)
     print("Training finished. Best ckpt:", checkpoint_cb.best_model_path)
+
 
 if __name__ == "__main__":
     main()
